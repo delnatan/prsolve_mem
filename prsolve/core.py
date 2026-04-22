@@ -32,9 +32,10 @@ Alpha schedule: secant interpolation on (log α, Ω) history targeting Ω = 1
                Option 2 target: α = G L / (S(G−N))  at convergence
 Alpha steering: Ω = G c²/(−2αS) guides α toward α_stop via secant + direct update
 Termination   : cloud mismatch H = ½ Σ v_i²/(α+λ_i), Test = 2H/G (MEMSYS5 §2.3)
-               H is re-evaluated at α_new (no Newton steps; only the entropy
-               weight in g changes).  Test_new < tol ⟹ h is already at MAP
-               for α_new ⟹ α has converged ⟹ algorithm stops.
+               H is re-evaluated at α_new with eigenvectors recomputed from
+               the updated h (exact Test, not the old-h approximation).
+               Test_new < tol ⟹ h is already at MAP for α_new ⟹ α has
+               converged ⟹ algorithm stops.
 Log evidence  : -N/2 log(L_val - αS) - ½ Σ log(1 + λ_i/α)  [Option 2, c² marginalised out]
 Output        : P(r) = f = C h  (smooth visible-space reconstruction)
 
@@ -335,13 +336,18 @@ def solve_pr(
                     G * L_val / (S * (G - N)), alpha * 0.1, alpha * 10.0
                 ))
                 # Cloud mismatch termination (MEMSYS5 §2.3, p.27-28):
-                # Re-evaluate H at alpha_new without Newton steps.
-                # Only the entropy weight α changes in the gradient; A, U, lam
-                # and the data residual are unchanged because h has not moved.
-                g_new = -alpha_new * np.log(h / m_f) + W.T @ resid
-                v_new = U.T @ (sqrth * g_new)
-                G_new = float(np.sum(lam / (alpha_new + lam)))
-                H_new = 0.5 * float(np.sum(v_new**2 / (alpha_new + lam)))
+                # Re-evaluate Test at alpha_new using the updated h and
+                # freshly recomputed eigenvectors (exact, no approximation).
+                sqrth_new = np.sqrt(h)
+                Wh_new = W * sqrth_new[None, :]
+                lam_new, U_new = np.linalg.eigh(Wh_new.T @ Wh_new)
+                lam_new = np.maximum(lam_new, 0.0)
+                F_new = R_eff @ h
+                resid_new = (I_obs - F_new) / sigma
+                g_new = -alpha_new * np.log(h / m_f) + W.T @ resid_new
+                v_new = U_new.T @ (sqrth_new * g_new)
+                G_new = float(np.sum(lam_new / (alpha_new + lam_new)))
+                H_new = 0.5 * float(np.sum(v_new**2 / (alpha_new + lam_new)))
                 Test_new = 2.0 * H_new / G_new if G_new > 0 else np.inf
                 # Test_new < tol: h is already at MAP for alpha_new, so alpha
                 # has converged to the stopping value → terminate.
@@ -357,32 +363,6 @@ def solve_pr(
         else:
             # h still very close to m (S ≈ 0): force alpha down by a decade
             alpha *= 0.1
-
-    # ---- Polish h for the final alpha ----
-    # The main loop may exit just after an alpha change (one Newton step with
-    # new α), leaving g non-zero. Continue iterating with fixed alpha until
-    # Test is tight so h is truly at the MaxEnt solution.
-    for _ in range(200):
-        h = np.maximum(h, h_floor)
-        sqrth = np.sqrt(h)
-        Wh = W * sqrth[None, :]
-        A = Wh.T @ Wh
-        lam_p, U_p = np.linalg.eigh(A)
-        lam_p = np.maximum(lam_p, 0.0)
-        F_p = R_eff @ h
-        resid_p = (I_obs - F_p) / sigma
-        g_p = -alpha * np.log(h / m_f) + W.T @ resid_p
-        v_p = U_p.T @ (sqrth * g_p)
-        H_p = 0.5 * float(np.sum(v_p**2 / (alpha + lam_p)))
-        G_p = float(np.sum(lam_p / (alpha + lam_p)))
-        Test_p = 2.0 * H_p / G_p if G_p > 0 else np.inf
-        if Test_p < tol * 0.01:
-            break
-        r0_sq_p = (rate * np.sqrt(np.sum(h))) ** 2
-        beta_p = _find_beta(lam_p, v_p, alpha, r0_sq_p)
-        dh_p = sqrth * (U_p @ (v_p / (beta_p + lam_p)))
-        h = h + dh_p
-        h = np.maximum(h, h_floor)
 
     # ---- Final output quantities ----
     f = C @ h  # visible P(r): smooth ICF-blurred reconstruction
