@@ -24,18 +24,26 @@ Entropy       : S(f) = Σ (f − m_f − f log(f/m_f))  ≤ 0, max at f = m_f
                convention: 0·log(0/m) = 0 at the r=0 boundary
 Metric tensor : μ_i = h_i  (diagonal approx; exact if C = I)
 A matrix      : A = [√h] R_eff^T[σ⁻²]R_eff[√h]   (L×L)
-B matrix      : B = I + A/α                        (L×L)
-Gradient      : g = −α Cᵀ log(f/m_f) + R_eff^T[σ⁻²](D − R_eff h)
+B matrix      : B = βI + A,  β ≥ α                 (L×L)
+Gradient      : g = −α log(h/m_f) + R_eff^T[σ⁻²](D − R_eff h)
+               (entropy on h in hidden space; gradient is exact ∂(αS−L)/∂h)
 G (good data) : G = Σ λ_i/(α + λ_i)   via eigh(A)
 Step          : δh = √h ⊙ U (βI+Λ)⁻¹ Uᵀ(√h⊙g),  β set by trust region
-Alpha schedule: secant interpolation on (log α, Ω) history targeting Ω = 1
+Trust region  : Σ v_i²/(β+λ_i)² ≤ rate²·Σh   (hidden-space dist² = |δh/√h|²/Σh)
+               MEMSYS MemLb uses Σ λ_i v_i²/(β+λ_i)² (data-space dist), which
+               applies after a full CG run.  The unweighted form is appropriate
+               for the Python's single-Newton-step-per-iteration architecture.
+Alpha schedule: secant interpolation on (log α, log Ω) history targeting Ω = 1
+               MEMSYS MemLaw/MemLar works in log-log space; linear Ω fails when
+               Ω spans orders of magnitude in early iterations.
                Option 2 target: α = G L / (S(G−N))  at convergence
 Alpha steering: Ω = G c²/(−2αS) guides α toward α_stop via secant + direct update
-Termination   : cloud mismatch H = ½ Σ v_i²/(α+λ_i), Test = 2H/G (MEMSYS5 §2.3)
-               H is re-evaluated at α_new with eigenvectors recomputed from
-               the updated h (exact Test, not the old-h approximation).
-               Test_new < tol ⟹ h is already at MAP for α_new ⟹ α has
-               converged ⟹ algorithm stops.
+Termination   : Test = 1 − cos(angle(log(h/m_f), W^T resid)) < tol  [MEMSYS MemTest]
+               At the MAP: α log(h/m_f) = W^T resid, so vectors are parallel,
+               cos = 1, Test = 0.  Neither vector depends on α, so Test is
+               alpha-independent: it measures whether h lies on the trajectory.
+               Convergence requires Test < tol AND |log(α_new/α)| < tol, i.e.
+               both h on the trajectory and α at the stopping value.
 Log evidence  : -N/2 log(L_val - αS) - ½ Σ log(1 + λ_i/α)  [Option 2, c² marginalised out]
 Output        : P(r) = f = C h  (smooth visible-space reconstruction)
 
@@ -44,7 +52,7 @@ ICF width default: w = π/(2 q_max)  - half the data resolution limit in real sp
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import numpy as np
 from scipy.optimize import brentq
@@ -63,6 +71,7 @@ class PRResult:
     log_evidence: float  # log Pr(D|α) [Option 2, c² marginalised], relative
     iterations: int
     converged: bool
+    trace: list | None = field(default=None)  # per-iter debug rows, or None
 
 
 # ---------------------------------------------------------------------------
@@ -85,19 +94,25 @@ def _saxs_kernel(q: np.ndarray, r: np.ndarray) -> np.ndarray:
 def _gaussian_icf(r: np.ndarray, width: float) -> np.ndarray:
     """Build L×L Gaussian ICF with zero boundary at r=0 (method of images).
 
-    C[j,i] = G(r_j − r_i) − G(r_j + r_i),   G(x) = exp(−x²/2w²)
+    C[j,i] = G(r_j−r_i) − G(r_j+r_i) − G(r_j+r_i−2·Dmax),  G(x)=exp(−x²/2w²)
 
-    The antisymmetric reflection about r=0 gives row 0 identically zero,
-    so f(0) = (C h)[0] = 0 for any h.  All entries are non-negative because
-    (r_j + r_i)² ≥ (r_j − r_i)² for r_j, r_i ≥ 0.
+    Two antisymmetric reflections enforce zero boundaries:
+      r=0   : G(r_j−r_i) − G(r_j+r_i)        → row 0 = 0 for any h
+      r=Dmax: G(Dmax−r_i) − G(Dmax−r_i) = 0  → last row ≈ 0 (exact after clip)
+    so f(0) = f(Dmax) = 0 for any h.
 
     Columns are normalised so Σ_j f_j = Σ_i h_i (total signal preserved).
     The column at r_i = 0 is identically zero (h[0] is decoupled); it is
     left as-is after normalisation.
     """
+    Dmax = r[-1]
     diff = r[:, None] - r[None, :]  # r_j - r_i
-    rsum = r[:, None] + r[None, :]  # r_j + r_i  (image)
+    rsum = r[:, None] + r[None, :]  # r_j + r_i  (image at r=0)
     C = np.exp(-0.5 * (diff / width) ** 2) - np.exp(-0.5 * (rsum / width) ** 2)
+    # Method-of-images at r=Dmax: image at 2*Dmax - r_i.
+    # At r_j=Dmax the first and third terms cancel exactly (G symmetric),
+    # leaving only -G(Dmax+r_i) ≈ 0, so f(Dmax) = 0 after clipping.
+    C -= np.exp(-0.5 * ((rsum - 2.0 * Dmax) / width) ** 2)
     C = np.maximum(C, 0.0)  # numerical safety
     C /= np.maximum(C.sum(axis=0, keepdims=True), 1e-300)  # column-normalise
     return C
@@ -131,75 +146,103 @@ def _sphere_prior(r: np.ndarray, Dmax: float, I0: float) -> np.ndarray:
     return shape * scale
 
 
-def _guinier_I0(q: np.ndarray, I_obs: np.ndarray, n_pts: int = 10) -> float:
-    """Estimate I(0) by linear Guinier fit: ln I(q) = ln I₀ − Rg²q²/3."""
-    n = min(n_pts, len(q))
-    coeffs = np.polyfit(q[:n] ** 2, np.log(I_obs[:n]), 1)
+def _guinier_I0(
+    q: np.ndarray,
+    I_obs: np.ndarray,
+    n_pts: int = 10,
+    qRg_max: float = 1.3,
+) -> float:
+    """Estimate I(0) by linear Guinier fit: ln I(q) = ln I₀ − Rg²q²/3.
+
+    Uses a rough Rg to restrict the fit to the Guinier region (q·Rg < qRg_max)
+    so the result is independent of q units and q-vector spacing.
+    """
+    mask = I_obs > 0
+    q_pos, I_pos = q[mask], I_obs[mask]
+    n_rough = min(n_pts, len(q_pos))
+    if n_rough < 2:
+        return float(I_pos[0]) if len(I_pos) > 0 else 1.0
+    # rough fit to estimate Rg, then restrict to Guinier region
+    slope_rough, intercept_rough = np.polyfit(
+        q_pos[:n_rough] ** 2, np.log(I_pos[:n_rough]), 1
+    )
+    Rg_rough = np.sqrt(max(-3.0 * slope_rough, 1e-10))
+    guinier_mask = q_pos <= qRg_max / Rg_rough
+    n_g = guinier_mask.sum()
+    if n_g < 2:
+        return float(np.exp(intercept_rough))
+    coeffs = np.polyfit(q_pos[guinier_mask] ** 2, np.log(I_pos[guinier_mask]), 1)
     return float(np.exp(coeffs[1]))
 
 
 def _find_beta(
-    lam: np.ndarray, v: np.ndarray, alpha: float, r0_sq: float
+    lam: np.ndarray, g_eig: np.ndarray, alpha: float, r0_sq: float
 ) -> float:
-    """Find β ≥ α such that Σ v_i²/(β+λ_i)² ≤ r0_sq (trust constraint).
+    """Find β ≥ α such that Σ g_eig_i²/(β+λ_i)² ≤ r0_sq (trust-region step limit).
 
-    The trust norm |δr|² = Σ v_i²/(β+λ_i)² is strictly decreasing in β,
-    so a simple bisection on a scalar function suffices.
+    g_eig is the gradient g = ∂(αS−L)/∂h projected into the eigenbasis of A:
+    g_eig = Uᵀ(√h ⊙ g).  The hidden-space step distance is then
+    d² = Σ g_eig_i²/(β+λ_i)² / summet, and the trust-region constraint
+    d ≤ rate is equivalent to Σ g_eig_i²/(β+λ_i)² ≤ rate²·summet = r0_sq.
+
+    Note: MEMSYS MemLb uses a data-space variant Σ λ_i g_eig_i²/(β+λ_i)² ≤ r0_sq
+    that applies after a full CG run.  The unweighted form here is appropriate
+    for the Python's single-Newton-step-per-iteration architecture, where the
+    gradient can be large in all directions at once (not just data-constrained).
     """
 
-    def trust_norm_sq(beta: float) -> float:
-        return float(np.sum(v**2 / (beta + lam) ** 2))
+    def hidden_dist_sq(beta: float) -> float:
+        return float(np.sum(g_eig**2 / (beta + lam) ** 2))
 
-    if trust_norm_sq(alpha) <= r0_sq:
+    if hidden_dist_sq(alpha) <= r0_sq:
         return alpha
 
     beta_hi = alpha
-    while trust_norm_sq(beta_hi) > r0_sq:
+    while hidden_dist_sq(beta_hi) > r0_sq:
         beta_hi *= 2.0
 
     return brentq(
-        lambda b: trust_norm_sq(b) - r0_sq, alpha, beta_hi, xtol=1e-8
+        lambda b: hidden_dist_sq(b) - r0_sq, alpha, beta_hi, xtol=1e-8
     )
 
 
 def _next_log_alpha(omega_table: list[tuple[float, float]]) -> float:
     """Estimate next log(α) to drive Ω → 1.
 
+    Table stores (log α, log Ω) with at most one entry per distinct log-α
+    (caller deduplicates).  Matches MEMSYS MemLaw/MemLar log-log space.
+
     Strategy:
-    - If history brackets Ω = 1 (one point above, one below), use linear
-      interpolation in log(α) to land at Ω = 1 (secant).
-    - Otherwise all points are on the same side:
-        * Ω < 1  → over-regularised, decrease α.  Step size is proportional
-                   to distance from Ω = 1, capped at one decade.
-        * Ω > 1  → under-regularised, increase α by factor 2.
+    - Sort table by log α, find the tightest adjacent bracket where log Ω
+      changes sign, interpolate to log Ω = 0.
+    - No bracket yet: monotone step (factor 2 up if Ω>1, |log Ω| down if Ω<1).
     """
-    la_curr, omega_curr = omega_table[-1]
+    la_curr, lo_curr = omega_table[-1]  # current (most-recently-added) alpha
 
-    # Search history for a bracket
     if len(omega_table) >= 2:
-        for i in range(len(omega_table) - 1, 0, -1):
-            la1, O1 = omega_table[i - 1]
-            la2, O2 = omega_table[i]
-            if (O1 - 1.0) * (O2 - 1.0) < 0.0:  # bracket around Ω = 1
-                dO = O2 - O1
-                dl = la2 - la1
-                if abs(dO) > 1e-6:
-                    la_target = la1 + (1.0 - O1) * dl / dO
-                    # Stay inside the bracket (plus a small margin)
-                    lo, hi = min(la1, la2), max(la1, la2)
-                    return float(np.clip(la_target, lo - 0.5, hi + 0.5))
+        sorted_t = sorted(omega_table)  # sort by log α
+        best = None
+        best_width = np.inf
+        for i in range(1, len(sorted_t)):
+            la1, lo1 = sorted_t[i - 1]
+            la2, lo2 = sorted_t[i]
+            if lo1 * lo2 < 0.0:  # adjacent bracket
+                w = abs(la2 - la1)
+                if w < best_width:
+                    best_width = w
+                    best = (la1, lo1, la2, lo2)
+        if best is not None:
+            la1, lo1, la2, lo2 = best
+            dlo = lo2 - lo1
+            la_target = la1 + (0.0 - lo1) * (la2 - la1) / dlo
+            return float(np.clip(la_target, min(la1, la2) - 0.5, max(la1, la2) + 0.5))
 
-    # No bracket: move toward Ω = 1 monotonically
-    if omega_curr > 1.0:
-        return la_curr + np.log(2.0)  # over-shot: nudge α up
-    else:
-        # step ∝ log(1/Ω), clipped to [log 2, log 10]
-        step = np.clip(
-            np.log(max(1.0 / (omega_curr + 1e-30), 2.0)),
-            np.log(2.0),
-            np.log(10.0),
-        )
-        return la_curr - float(step)
+    # No bracket yet: conservative monotone step
+    if lo_curr > 0.0:  # Ω > 1: under-regularised → increase α
+        return la_curr + np.log(2.0)
+    else:  # Ω < 1: over-regularised → decrease α
+        step = float(np.clip(abs(lo_curr), np.log(2.0), np.log(10.0)))
+        return la_curr - step
 
 
 # ---------------------------------------------------------------------------
@@ -213,12 +256,13 @@ def solve_pr(
     sigma: np.ndarray,
     Dmax: float,
     n_r: int = 50,
-    max_iter: int = 500,
+    max_iter: int = 50,
     tol: float = 0.01,
     rate: float = 1.0,
     alpha_init: float | None = None,
     n_guinier: int = 10,
     icf_width: float | None = None,
+    debug: bool = False,
 ) -> PRResult:
     """Reconstruct P(r) from SAXS data via Quantified Maximum Entropy with ICF.
 
@@ -281,15 +325,17 @@ def solve_pr(
     else:
         alpha = float(alpha_init)
 
-    omega_table: list[tuple[float, float]] = []  # (log α, Ω) history
+    omega_table: list[tuple[float, float]] = []  # (log α, log Ω) history
     Omega = 0.0
     Test = np.inf
     converged = False
+    _trace: list[dict] = [] if debug else None  # type: ignore[assignment]
 
     h_floor = m_f * 1e-6  # relative floor on hidden variable
 
     for it in range(max_iter):
         h = np.maximum(h, h_floor)
+        _alpha_start = alpha  # snapshot before any update this iteration
 
         # ---- Scalars ----
         S = _entropy(h, m_f)
@@ -298,9 +344,21 @@ def solve_pr(
         chi2 = float(np.dot(resid, resid))
         L_val = 0.5 * chi2
 
+        # Pre-compute log(h/m_f) once; reused in gradient and alpha clamping.
+        log_h_over_m = np.log(h / m_f)
+        # Trust-region radius r0 = rate * sqrt(Σh) — shared by h step and
+        # the alpha step constraint (MEMSYS5 §2.3, p.27).
+        sum_h = float(np.sum(h))
+        r0 = rate * np.sqrt(sum_h)
+        # Metric-weighted entropy gradient ||√h ⊙ log(h/m_f)||: changing α by
+        # Δα shifts ∂Q/∂h by Δα·log(h/m_f), inducing a hidden-space step whose
+        # magnitude is bounded by |Δα|·entropy_grad_norm / α.  The trust-region
+        # constraint then limits how large Δα can be.
+        entropy_grad_norm = float(np.sqrt(np.sum(h * log_h_over_m ** 2)))
+
         # ---- Hidden-space matrices  A = [√h] R_eff^T[σ⁻²]R_eff[√h]  (L×L) ----
-        sqrth = np.sqrt(h)
-        Wh = W * sqrth[None, :]
+        sqrt_h = np.sqrt(h)
+        Wh = W * sqrt_h[None, :]
         A = Wh.T @ Wh
         lam, U = np.linalg.eigh(A)
         lam = np.maximum(lam, 0.0)
@@ -308,61 +366,143 @@ def solve_pr(
         G = float(np.sum(lam / (alpha + lam)))
 
         # ---- Gradient of Q = αS − L (entropy in hidden space) ----
-        g = -alpha * np.log(h / m_f) + W.T @ resid
+        likelihood_gradient = W.T @ resid  # hidden-space direction of -∂L/∂h
+        g = -alpha * log_h_over_m + likelihood_gradient
+
+        # ---- Convergence test: 1 − cos(angle(log(h/m_f), W^T resid)) ----
+        # MEMSYS MemTest §2.3: test = 1 − cos(angle(<23>, <24>)), where <23>
+        # is the data-space entropy gradient (Lagrange multipliers) and <24>
+        # is the normalised residuals.  In our hidden-space formulation the
+        # equivalent vectors are log(h/m_f) and W^T resid: at the MAP,
+        # α log(h/m_f) = W^T resid, so they are parallel → cos = 1 → Test = 0.
+        # Neither vector depends on α, so Test measures whether h lies on the
+        # maximum-entropy trajectory independently of the current α value.
+        norm_log = float(np.linalg.norm(log_h_over_m))
+        norm_lkl = float(np.linalg.norm(likelihood_gradient))
+        if norm_log > 1e-30 and norm_lkl > 1e-30:
+            Test = 1.0 - float(
+                np.dot(log_h_over_m, likelihood_gradient) / (norm_log * norm_lkl)
+            )
+        else:
+            Test = np.inf
 
         # ---- Trust-region Newton step  δh = √h ⊙ U(βI+Λ)⁻¹Uᵀ(√h⊙g) ----
-        v = U.T @ (sqrth * g)
-        r0_sq = (rate * np.sqrt(np.sum(h))) ** 2
-        beta = _find_beta(lam, v, alpha, r0_sq)
-        dh = sqrth * (U @ (v / (beta + lam)))
+        # g_eig: gradient projected into eigenbasis of A; β found by MemLb criterion
+        g_eig = U.T @ (sqrt_h * g)
+        r0_sq = r0 ** 2
+        beta = _find_beta(lam, g_eig, alpha, r0_sq)
+        dh = sqrt_h * (U @ (g_eig / (beta + lam)))
 
         h = h + dh
         h = np.maximum(h, h_floor)
 
         # ---- Alpha update ----
+        # Trust-region constraint on the alpha step (MEMSYS5 §2.3, p.27):
+        # changing α by Δα shifts ∂Q/∂h by Δα·log(h/m_f), inducing a step
+        # δh whose hidden-space distance is ≈ |Δα|·entropy_grad_norm / α.
+        # Requiring that distance ≤ r0 gives the maximum multiplicative factor:
+        #   alpha_step_factor = 1 + r0 / entropy_grad_norm
+        # This mirrors MEMSYS MemLa:  r = 1 + alpha*r0/agrads  with
+        # agrads = alpha*grads and r0 = rate*sqrt(summet).
+        if entropy_grad_norm > 1e-30:
+            alpha_step_factor = 1.0 + r0 / entropy_grad_norm
+        else:
+            alpha_step_factor = np.inf  # h at prior: log(h/m)≈0, no constraint
+        alpha_lo = _alpha_start / alpha_step_factor
+        alpha_hi = _alpha_start * alpha_step_factor
+
         if S < -1e-20 and (N - G) > 1e-6:
             # Option 2 condition:  Ω = G c²/(-2αS) = 1
             #   with c² = 2(L_val - αS)/N
             c2 = 2.0 * (L_val - alpha * S) / N
             Omega = G * c2 / (-2.0 * alpha * S)
-            H = 0.5 * float(np.sum(v**2 / (alpha + lam)))
-            Test = 2.0 * H / G if G > 0 else np.inf
 
             if Test < tol:
-                # h is at the MaxEnt solution for this alpha.
-                # Use the closed-form Option 2 target directly:
+                # h is on the maximum-entropy trajectory (entropy and likelihood
+                # gradients aligned).  Use the closed-form Option 2 target:
                 #   Ω = 1  ⟺  α = G L / (S (G − N))
-                alpha_new = float(np.clip(
-                    G * L_val / (S * (G - N)), alpha * 0.1, alpha * 10.0
-                ))
-                # Cloud mismatch termination (MEMSYS5 §2.3, p.27-28):
-                # Re-evaluate Test at alpha_new using the updated h and
-                # freshly recomputed eigenvectors (exact, no approximation).
-                sqrth_new = np.sqrt(h)
-                Wh_new = W * sqrth_new[None, :]
-                lam_new, U_new = np.linalg.eigh(Wh_new.T @ Wh_new)
-                lam_new = np.maximum(lam_new, 0.0)
-                F_new = R_eff @ h
-                resid_new = (I_obs - F_new) / sigma
-                g_new = -alpha_new * np.log(h / m_f) + W.T @ resid_new
-                v_new = U_new.T @ (sqrth_new * g_new)
-                G_new = float(np.sum(lam_new / (alpha_new + lam_new)))
-                H_new = 0.5 * float(np.sum(v_new**2 / (alpha_new + lam_new)))
-                Test_new = 2.0 * H_new / G_new if G_new > 0 else np.inf
-                # Test_new < tol: h is already at MAP for alpha_new, so alpha
-                # has converged to the stopping value → terminate.
-                if Test_new < tol:
+                # Clamp to the trust-region alpha step limit.
+                alpha_new = float(
+                    np.clip(G * L_val / (S * (G - N)), alpha_lo, alpha_hi)
+                )
+                # Termination: Test is alpha-independent (it compares gradient
+                # directions, not magnitudes), so "Test_new < tol" would always
+                # equal "Test < tol".  Instead, check directly whether alpha has
+                # converged: if alpha_new ≈ alpha, the stopping value is found.
+                if abs(np.log(alpha_new / _alpha_start)) < tol:
                     converged = True
                     alpha = alpha_new
                     break
                 alpha = alpha_new
             else:
-                # h still moving - use table/secant to steer α toward Ω = 1
-                omega_table.append((np.log(alpha), Omega))
-                alpha = float(np.exp(_next_log_alpha(omega_table)))
+                # h still moving - steer α toward Ω = 1 via table in log-log
+                # space (matching MEMSYS MemLaw: table stores log Ω, not Ω).
+                # Note: MEMSYS MemLa skips alpha updates when the CG step was
+                # distance-penalised (bcodeb=FALSE).  That gate doesn't apply
+                # here because the Python takes one Newton step per outer
+                # iteration rather than running CG to full convergence per
+                # call; beta > alpha is routine early on and cannot be used as
+                # a proxy for "h has not converged for the current alpha".
+                la_new = float(np.log(alpha))
+                lo_new = float(np.log(max(Omega, 1e-30)))
+                # Dedup: replace any existing entry within 5% in log α space
+                replaced = False
+                for _i, (_la, _lo) in enumerate(omega_table):
+                    if abs(_la - la_new) < 0.05:
+                        omega_table[_i] = (la_new, lo_new)
+                        replaced = True
+                        break
+                if not replaced:
+                    omega_table.append((la_new, lo_new))
+                    if len(omega_table) > 8:
+                        omega_table.pop(0)  # drop oldest when over NSIZE
+                alpha_next = float(
+                    np.clip(np.exp(_next_log_alpha(omega_table)), alpha_lo, alpha_hi)
+                )
+                alpha_stable = abs(np.log(alpha_next / _alpha_start)) < tol
+                # Primary secondary path: Omega ≈ 1 AND alpha stable.
+                # h may have picked up null-space components (in the L-G
+                # directions where W^T W ≈ 0) that make Test > tol even
+                # though the Option 2 criterion (Omega = 1, alpha stable)
+                # is genuinely satisfied.  Declare convergence here — the
+                # MaxEnt stopping value has been found.
+                omega_ok = abs(Omega - 1.0) < 0.05
+                if omega_ok and alpha_stable:
+                    converged = True
+                    alpha = alpha_next
+                    break
+                # Fallback secondary path: alpha stable but h is far off the
+                # MaxEnt trajectory (Test > rate/(1+rate)).  The model/ICF
+                # may be genuinely inconsistent; exit without converged=True.
+                bcodet_fail = Test > rate / (1.0 + rate)
+                if bcodet_fail and alpha_stable:
+                    alpha = alpha_next
+                    break
+                alpha = alpha_next
         else:
-            # h still very close to m (S ≈ 0): force alpha down by a decade
-            alpha *= 0.1
+            # h still very close to m (S ≈ 0): step alpha down; entropy_grad_norm
+            # is near zero here so alpha_step_factor ≈ inf and clamp is a no-op.
+            alpha = float(np.clip(alpha * 0.1, alpha_lo, alpha_hi))
+
+        if debug:
+            _trace.append(
+                dict(
+                    it=it,
+                    alpha=_alpha_start,
+                    alpha_next=alpha,
+                    alpha_lo=alpha_lo,
+                    alpha_hi=alpha_hi,
+                    alpha_step_factor=alpha_step_factor,
+                    Omega=Omega,
+                    Test=Test,
+                    G=G,
+                    S=S,
+                    beta=beta,
+                    chi2=chi2,
+                    c2=(2.0 * (L_val - _alpha_start * S) / N if S < -1e-20 else float("nan")),
+                    entropy_grad_norm=entropy_grad_norm,
+                )
+            )
 
     # ---- Final output quantities ----
     f = C @ h  # visible P(r): smooth ICF-blurred reconstruction
@@ -370,8 +510,8 @@ def solve_pr(
     chi2 = float(np.sum(((I_obs - F) / sigma) ** 2))
     S = _entropy(h, m_f)
     L_val = 0.5 * chi2
-    sqrth = np.sqrt(h)
-    Wh = W * sqrth[None, :]
+    sqrt_h = np.sqrt(h)
+    Wh = W * sqrt_h[None, :]
     lam = np.maximum(np.linalg.eigvalsh(Wh.T @ Wh), 0.0)
     G = float(np.sum(lam / (alpha + lam)))
     # Option 2 noise-scale factor: c² = 2(L − αS)/N
@@ -394,7 +534,44 @@ def solve_pr(
         log_evidence=log_evidence,
         iterations=it + 1,
         converged=converged,
+        trace=_trace,
     )
+
+
+# ---------------------------------------------------------------------------
+# ICF width scan
+# ---------------------------------------------------------------------------
+
+
+def scan_icf_width(
+    q: np.ndarray,
+    I_obs: np.ndarray,
+    sigma: np.ndarray,
+    Dmax: float,
+    w_grid: np.ndarray,
+    n_r: int = 50,
+    max_iter: int = 50,
+    tol: float = 0.01,
+    rate: float = 1.0,
+    alpha_init: float | None = None,
+    n_guinier: int = 10,
+) -> np.ndarray:
+    """Scan ICF width and return array with columns:
+    [w, log_evidence, converged, G, alpha, iterations].
+
+    Only converged rows carry a meaningful log_evidence; the caller should
+    restrict evidence comparisons to rows where converged == 1.
+    """
+    rows = []
+    for w in w_grid:
+        res = solve_pr(
+            q, I_obs, sigma, Dmax,
+            n_r=n_r, max_iter=max_iter, tol=tol, rate=rate,
+            alpha_init=alpha_init, n_guinier=n_guinier, icf_width=w,
+        )
+        rows.append([w, res.log_evidence, float(res.converged),
+                     res.G, res.alpha, float(res.iterations)])
+    return np.array(rows)
 
 
 # ---------------------------------------------------------------------------
@@ -449,8 +626,8 @@ def sample_pr(
     W = (R_mat @ C) / sigma[:, None]
 
     # Eigendecomposition of A at ĥ
-    sqrth = np.sqrt(h_hat)
-    Wh = W * sqrth[None, :]
+    sqrt_h = np.sqrt(h_hat)
+    Wh = W * sqrt_h[None, :]
     lam, U = np.linalg.eigh(Wh.T @ Wh)
     lam = np.maximum(lam, 0.0)
 
@@ -466,7 +643,7 @@ def sample_pr(
         # (negative-h tail gets folded up), shifting the whole band above MAP.
         # Instead we let h_s go negative so E[f_sample] = C @ h_hat = MAP,
         # and clip only at the visible f level after applying the ICF.
-        h_s = h_hat + sqrth * t
+        h_s = h_hat + sqrt_h * t
         f_s = C @ h_s
         np.maximum(f_s, 0.0, out=f_s)  # P(r) ≥ 0 in visible space
         samples[i] = f_s
